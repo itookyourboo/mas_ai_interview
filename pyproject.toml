@@ -1,0 +1,10 @@
+[project]
+name = "mas-ai-interview"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "langchain-openai>=1.0.1",
+    "langgraph>=1.0.2",
+    "python-dotenv>=1.2.1",
+]
