@@ -1,11 +1,18 @@
 [project]
 name = "mas-ai-interview"
 version = "0.1.0"
-description = "Add your description here"
+description = "Мультиагентная система для проведения AI-собеседований"
 requires-python = ">=3.13"
 dependencies = [
     "langchain-gigachat>=0.3.12",
     "langchain-openai>=0.3.35",
     "langgraph>=1.0.1",
     "python-dotenv>=1.2.1",
+    "streamlit>=1.40.0",
+    "requests>=2.32.0",
+    "beautifulsoup4>=4.12.0",
+    "nest-asyncio>=1.6.0",
 ]
+
+[project.scripts]
+interview-app = "src.app:main"
