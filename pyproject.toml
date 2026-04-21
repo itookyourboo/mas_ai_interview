@@ -6,7 +6,12 @@ requires-python = ">=3.13"
 dependencies = [
     "langchain-gigachat>=0.3.12",
     "langchain-openai>=0.3.35",
+    "langchain-ollama>=0.2.0",
+    "langchain-community>=0.3.0",
+    "langchain-chroma>=0.2.0",
+    "langchain-text-splitters>=0.3.0",
     "langgraph>=1.0.1",
+    "chromadb>=0.5.5",
     "python-dotenv>=1.2.1",
     "streamlit>=1.40.0",
     "requests>=2.32.0",
@@ -16,3 +21,4 @@ dependencies = [
 
 [project.scripts]
 interview-app = "src.app:main"
+build-rag-index = "src.rag.build_index:main"

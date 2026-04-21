@@ -49,17 +49,46 @@ uv sync
 cp .env.template .env
 ```
 
-Заполните переменные:
+Базовый `quality-first` профиль:
 
 ```env
-MODEL_API_KEY=your_gigachat_api_key
-MODEL_NAME=GigaChat-Max
-MODEL_BASE_URL=  # опционально
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_CHAT_MODEL=qwen2.5:14b-instruct
+OLLAMA_EMBED_MODEL=nomic-embed-text
+RAG_SOURCE_JSON=questions_with_tags_and_answers.json
+RAG_DB_PATH=data/rag/chroma
 ```
+
+Почему именно так:
+- `qwen2.5:14b-instruct` — сильная локальная модель для русскоязычных тех. вопросов, лучше держит reasoning и формат JSON.
+- `nomic-embed-text` — стабильный baseline эмбеддингов для mixed RU/EN технического текста.
+- Если 14B слишком медленно: переключите `OLLAMA_CHAT_MODEL=qwen2.5:7b-instruct`.
 
 ## Запуск
 
-### Веб-интерфейс (Streamlit)
+### 0. Подготовить локальные модели Ollama
+
+```shell
+ollama pull qwen2.5:14b-instruct
+ollama pull nomic-embed-text
+```
+
+### 1. Построить локальный RAG-индекс
+
+```shell
+uv run python -m src.rag.build_index
+```
+
+Индекс создаётся из `questions_with_tags_and_answers.json` с фильтрацией технических вопросов.
+
+Для быстрого smoke-теста:
+
+```shell
+uv run python -m src.rag.build_index --limit 300 --batch-size 32
+```
+
+### 2. Веб-интерфейс (Streamlit)
 
 ```shell
 uv run streamlit run src/app.py
@@ -67,13 +96,19 @@ uv run streamlit run src/app.py
 
 Откройте в браузере: http://localhost:8501
 
-### Генерация вопросов (CLI)
+### 3. Генерация вопросов (CLI)
 
 ```shell
 uv run src/main.py
 ```
 
 Результат будет сохранён в `interview_questions.json`.
+
+## Локальный RAG: как используется
+
+- **Генерация вопросов**: в `design/generate` узлы подмешиваются примеры похожих вопросов из векторной базы.
+- **Защита от копипаста**: валидатор отклоняет почти дословные дубликаты вопросов из базы.
+- **Оценка ответов**: агенты получают эталонные ответы (retrieved snippets) и оценивают кандидата относительно них.
 
 ## Использование
 
@@ -106,10 +141,15 @@ uv run src/main.py
 mas_ai_interview/
 ├── src/
 │   ├── __init__.py
-│   ├── main.py          # Генерация вопросов (LangGraph)
-│   ├── agents.py        # Агенты оценки ответов
+│   ├── main.py          # Генерация вопросов (LangGraph + RAG)
+│   ├── agents.py        # Агенты оценки ответов (RAG references)
 │   ├── app.py           # Streamlit веб-интерфейс
+│   ├── llm_provider.py  # Провайдер LLM/embeddings (Ollama/GigaChat)
 │   ├── parse_hh.py      # Парсер вакансий hh.ru
+│   ├── rag/
+│   │   ├── build_index.py
+│   │   ├── indexer.py
+│   │   └── retriever.py
 │   └── settings.py      # Настройки приложения
 ├── data/
 │   ├── interviews/      # Сохранённые собеседования
@@ -136,9 +176,58 @@ mas_ai_interview/
 
 - **Python 3.13+**
 - **LangChain + LangGraph** — оркестрация LLM
-- **GigaChat** — языковая модель
+- **Ollama + Qwen2.5** — локальная языковая модель
+- **Chroma** — локальная векторная база
 - **Streamlit** — веб-интерфейс
 - **BeautifulSoup** — парсинг HTML
+
+## Тестирование системы (подробный протокол)
+
+### 1) Smoke / интеграция
+1. Убедиться, что `uv run python -m src.rag.build_index` завершается успешно.
+2. Проверить запуск `uv run streamlit run src/app.py` без облачного API ключа.
+3. Сгенерировать интервью и пройти 1-2 ответа, проверить что оценка проходит.
+
+### 2) Retrieval quality
+1. Подготовить фиксированный набор 30-50 технических query.
+2. Считать метрики:
+   - `Recall@k` (есть ли релевантный эталон в топ-k),
+   - `MRR@k` (позиция первого релевантного),
+   - доля нерелевантных top-1.
+3. Сравнить `RAG_TOP_K_EVAL=3` и `RAG_TOP_K_EVAL=5`.
+
+### 3) Генерация вопросов
+1. Для `Junior/Middle/Senior` сделать минимум 20 прогонов на уровень.
+2. Проверить:
+   - соответствие уровню и теме вакансии,
+   - отсутствие дословных дублей из базы,
+   - прогрессию сложности по порядку вопросов.
+3. Дополнительно измерить diversity (уникальные формулировки).
+
+### 4) Оценка ответов
+1. Собрать benchmark из 100 пар `question + candidate_answer` с ручной экспертной оценкой.
+2. Сравнить baseline и RAG-версию:
+   - корреляция Spearman/Pearson,
+   - MAE по итоговому баллу.
+3. Edge-cases:
+   - частично верный ответ,
+   - оффтоп,
+   - верная идея без деталей,
+   - длинный ответ с шумом.
+
+### 5) Нагрузочное тестирование
+1. Прогнать 1/3/5 параллельных интервью.
+2. Снять:
+   - latency p50/p95 для генерации вопроса,
+   - latency `assess_answer`,
+   - RAM/VRAM,
+   - стабильность (timeouts/OOM).
+
+### 6) Критерии приёмки
+- Нет обращений к внешнему LLM в стандартном сценарии.
+- Не менее 90% интервью завершаются без ошибок агентов.
+- Метрики retrieval не деградируют после переиндексации.
+- Корреляция с ручной разметкой выше baseline.
 
 ## Лицензия
 

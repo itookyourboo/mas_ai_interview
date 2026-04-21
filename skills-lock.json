@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "rag-implementation": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "computedHash": "fcf8874b44501e34362a3c31e231f922f3ea1376c8afaf92e8550f88287e1ca2"
+    }
+  }
+}

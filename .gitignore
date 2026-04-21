@@ -1,1 +1,6 @@
 /.env
+data
+__pycache__
+.DS_Store
+questions_with_tags_and_answers.json
+docs

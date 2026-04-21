@@ -15,8 +15,18 @@ from pathlib import Path
 import nest_asyncio
 import streamlit as st
 
-# Разрешаем вложенные event loops (нужно для Streamlit + asyncio)
-nest_asyncio.apply()
+# Разрешаем вложенные event loops (нужно для Streamlit + asyncio).
+# В некоторых окружениях uvloop используется как policy, а nest_asyncio не умеет
+# патчить uvloop.Loop — в этом случае мягко переключаемся на стандартный asyncio loop.
+try:
+    policy_module = asyncio.get_event_loop_policy().__class__.__module__
+    if policy_module.startswith('uvloop'):
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    nest_asyncio.apply()
+except ValueError as e:
+    # Не блокируем запуск приложения: fallback на обычный event loop.
+    # run_async ниже корректно обработает выполнение корутин.
+    print(f'Предупреждение: nest_asyncio не применён ({e}). Используется fallback.')
 
 # Настройка страницы
 st.set_page_config(
@@ -52,7 +62,14 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 def run_async(coro):
     """Запустить async функцию в синхронном контексте."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError('Event loop is closed')
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        # Фолбэк для случаев, когда текущий loop отсутствует/закрыт.
+        return asyncio.run(coro)
 
 
 def save_interview(interview_id: str, data: dict):
@@ -480,6 +497,8 @@ def render_evaluating_stage():
                 question_type=q.get('type', 'теория'),
                 tech_stack=params.get('tech_stack', ''),
                 candidate_level=params.get('level', 'Middle'),
+                question_tags=q.get('tags', []),
+                follow_ups=q.get('follow_ups', []),
             ))
             assessments.append(assessment_result_to_dict(result))
         except Exception as e:
@@ -519,10 +538,13 @@ def render_completed_stage():
     total_score = st.session_state.total_score
     
     # Определяем цвет и текст рекомендации
-    if total_score >= 7.5:
+    if total_score >= 4.5:
         score_class = 'score-high'
         recommendation = '✅ Сильный кандидат'
-    elif total_score >= 5.0:
+    elif total_score >= 3.5:
+        score_class = 'score-medium'
+        recommendation = '👍 Хороший кандидат'
+    elif total_score >= 2.5:
         score_class = 'score-medium'
         recommendation = '⚠️ Требует развития'
     else:
@@ -537,7 +559,7 @@ def render_completed_stage():
         <div style="text-align: center; padding: 2rem; background: #f8f9fa; border-radius: 10px; color: #212529;">
             <h2 style="color: #212529;">Общая оценка</h2>
             <div class="score-badge {score_class}" style="font-size: 2rem;">
-                {total_score:.1f}/10
+                {total_score:.1f}/5
             </div>
             <p style="margin-top: 1rem; color: #212529;">{recommendation}</p>
         </div>
@@ -565,12 +587,14 @@ def render_completed_stage():
             
             with col1:
                 score = assessment['total_score']
-                if score >= 7.5:
-                    st.success(f'Оценка: {score:.1f}/10')
-                elif score >= 5.0:
-                    st.warning(f'Оценка: {score:.1f}/10')
+                if score >= 4.5:
+                    st.success(f'Оценка: {score:.1f}/5')
+                elif score >= 3.5:
+                    st.info(f'Оценка: {score:.1f}/5')
+                elif score >= 2.5:
+                    st.warning(f'Оценка: {score:.1f}/5')
                 else:
-                    st.error(f'Оценка: {score:.1f}/10')
+                    st.error(f'Оценка: {score:.1f}/5')
             
             with col2:
                 st.markdown(f"**{assessment['final_feedback']}**")
@@ -603,7 +627,7 @@ def render_completed_stage():
                     # Успешный агент
                     st.markdown(f'''
                     <div class="agent-card">
-                        <strong>{agent_score["agent_name"]}</strong>: {agent_score["score"]:.1f}/10
+                        <strong>{agent_score["agent_name"]}</strong>: {agent_score["score"]:.1f}/5
                         <br><small>{agent_score["feedback"]}</small>
                     </div>
                     ''', unsafe_allow_html=True)
@@ -694,7 +718,7 @@ def render_results():
             col1, col2, col3 = st.columns([1, 1, 1])
             
             with col1:
-                st.metric('Общая оценка', f"{full_data.get('total_score', 0):.1f}/10")
+                st.metric('Общая оценка', f"{full_data.get('total_score', 0):.1f}/5")
             
             with col2:
                 st.metric('Статус', '✅ Завершено' if full_data['status'] == 'completed' else '⏳ В процессе')
@@ -717,11 +741,11 @@ def render_results():
                         continue
                     
                     score = assessment['total_score']
-                    color = 'green' if score >= 7.5 else ('orange' if score >= 5 else 'red')
+                    color = 'green' if score >= 4.5 else ('orange' if score >= 2.5 else 'red')
                     
                     st.markdown(f'''
                     **{i + 1}. {q.get("question", "")[:60]}...**  
-                    Оценка: :{color}[{score:.1f}/10] — {assessment.get("final_feedback", "")}
+                    Оценка: :{color}[{score:.1f}/5] — {assessment.get("final_feedback", "")}
                     ''')
             
             # Кнопки
@@ -753,14 +777,16 @@ def render_settings():
     """Страница настроек."""
     st.markdown('<h1 class="main-header">⚙️ Настройки</h1>', unsafe_allow_html=True)
     
-    st.subheader('API настройки')
+    st.subheader('LLM и RAG настройки')
     
     st.info('''
-    Настройки API хранятся в файле `.env` в корне проекта.
+    Настройки хранятся в файле `.env` в корне проекта.
     
-    Необходимые переменные:
-    - `MODEL_API_KEY` — ключ API для GigaChat
-    - `MODEL_NAME` — название модели (например, GigaChat-Max)
+    Ключевые переменные:
+    - `LLM_PROVIDER` — `ollama` или `gigachat`
+    - `OLLAMA_CHAT_MODEL` — модель генерации/оценки
+    - `OLLAMA_EMBED_MODEL` — модель эмбеддингов для RAG
+    - `RAG_DB_PATH` — путь к локальной векторной базе
     ''')
     
     # Проверка настроек
@@ -771,16 +797,29 @@ def render_settings():
     col1, col2 = st.columns(2)
     
     with col1:
-        if s.MODEL_API_KEY:
+        if s.LLM_PROVIDER == 'ollama':
+            st.success(f'✅ LLM_PROVIDER: {s.LLM_PROVIDER}')
+        elif s.MODEL_API_KEY:
             st.success('✅ MODEL_API_KEY настроен')
         else:
-            st.error('❌ MODEL_API_KEY не найден')
+            st.error('❌ Нет настроек для выбранного LLM_PROVIDER')
     
     with col2:
-        if s.MODEL_NAME:
+        if s.LLM_PROVIDER == 'ollama':
+            st.success(f'✅ OLLAMA_CHAT_MODEL: {s.OLLAMA_CHAT_MODEL}')
+        elif s.MODEL_NAME:
             st.success(f'✅ MODEL_NAME: {s.MODEL_NAME}')
         else:
-            st.warning('⚠️ MODEL_NAME не указан')
+            st.warning('⚠️ Имя модели не указано')
+
+    rag_path = Path(s.RAG_DB_PATH)
+    if rag_path.exists():
+        st.success(f'✅ RAG база найдена: {s.RAG_DB_PATH}')
+    else:
+        st.warning(
+            f'⚠️ RAG база не найдена: {s.RAG_DB_PATH}. '
+            'Выполните: uv run python -m src.rag.build_index'
+        )
     
     st.markdown('---')
     
