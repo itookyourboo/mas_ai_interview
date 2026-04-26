@@ -5,6 +5,7 @@ CLI для построения локального RAG-индекса.
 import argparse
 
 from .indexer import build_vector_index
+from .. import settings
 
 
 def main():
@@ -22,6 +23,14 @@ def main():
         help="Размер батча при индексации",
     )
     args = parser.parse_args()
+
+    print(
+        "RAG runtime: "
+        f"provider={settings.LLM_PROVIDER} "
+        f"embed_model={settings.OLLAMA_EMBED_MODEL} "
+        f"db_path={settings.RAG_DB_PATH} "
+        f"collection={settings.RAG_COLLECTION_NAME}"
+    )
 
     limit = args.limit if args.limit > 0 else None
     stats = build_vector_index(limit=limit, batch_size=args.batch_size)

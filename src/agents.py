@@ -190,7 +190,6 @@ SCORE_RUBRIC_1_TO_5 = '''
 
 AGENT_SCORING_POLICY = '''
 Применяйте эту шкалу как общий ориентир итоговой полноты и качества ответа,
-но выставляйте балл СТРОГО с учетом роли текущего агента и его профильных критериев.
 '''
 
 
@@ -307,9 +306,9 @@ CODE_QUALITY_PROMPT = ChatPromptTemplate.from_messages([
     ('system', '''Вы — эксперт по качеству кода и best practices.
 Ваша задача — проанализировать качество кода в ответе (если он есть).
 
-Оцените по целочисленной шкале от 1 до 5.
-Баллы выставляйте по качеству инженерного решения и кода, а не по полноте теории.
-ЖЕСТКОЕ ПРАВИЛО: 5 ставьте только если кроме качества решения корректно покрыты основной и все follow-up вопросы.
+Используйте целочисленную оценку от 1 до 5.
+Баллы выставляйте ТОЛЬКО по качеству инженерного решения и кода/изложения,
+а не по полноте теории и не по общей "строгости" шкалы.
 
 Дополнительно учитывайте:
 - Читаемость и форматирование
@@ -318,7 +317,14 @@ CODE_QUALITY_PROMPT = ChatPromptTemplate.from_messages([
 - Правильное именование
 - Отсутствие code smells
 
-Если в ответе нет кода, оцените структурированность и ясность изложения.
+КРИТИЧНО ВАЖНО ПО ТИПУ ВОПРОСА:
+- Если тип вопроса = "код": оценивайте именно инженерное качество решения в коде.
+- Если тип вопроса = "теория" / "системный дизайн" / "отладка":
+  отсутствие кода НЕ является штрафом само по себе.
+  В этих типах оценивайте структурированность, техническую точность и применимость рекомендаций.
+
+Если в ответе нет кода, оцените структурированность и ясность изложения
+с учетом типа вопроса и НЕ требуйте код там, где он не обязателен.
 Фокус этого агента: инженерное качество решения и стиль изложения.
 
 Ответьте строго в формате JSON:
@@ -326,10 +332,10 @@ CODE_QUALITY_PROMPT = ChatPromptTemplate.from_messages([
     "score": <целое число от 1 до 5>,
     "feedback": "<краткий отзыв>",
     "strengths": ["<сильные стороны>"],
-    "improvements": ["<что можно улучшить>"],
-    "follow_ups_answered": <целое число: сколько follow-up вопросов покрыто>
+    "improvements": ["<что можно улучшить>"]
 }}'''),
     ('human', '''Вопрос: {question}
+Тип вопроса: {question_type}
 Технологии: {tech_stack}
 
 Эталонные ответы:
@@ -348,14 +354,9 @@ CONCEPTUAL_PROMPT = ChatPromptTemplate.from_messages([
     ('system', '''Вы — эксперт по оценке глубины понимания технических концепций.
 Ваша задача — оценить, насколько глубоко кандидат понимает тему.
 
-Оцените по целочисленной шкале от 1 до 5:
-- 1: поверхностное понимание, нет причинно-следственных связей
-- 2: базовое понимание, без глубины
-- 3: уверенные основы, но без нюансов и trade-offs
-- 4: хорошее понимание, объясняет почему и как
-- 5: глубокое понимание, затрагивает нюансы и смежные темы, и корректно покрывает основной и все follow-up вопросы
-
-ЖЕСТКОЕ ПРАВИЛО: 5 ставьте только при полном покрытии основного и всех follow-up вопросов.
+Используйте целочисленную оценку от 1 до 5.
+Оценивайте только глубину понимания, причинно-следственные связи и trade-offs.
+Не применяйте формальную рубрику целиком — этот агент отвечает только за conceptual depth.
 
 Фокус этого агента: глубина понимания концепций, причин и trade-offs.
 
@@ -364,8 +365,7 @@ CONCEPTUAL_PROMPT = ChatPromptTemplate.from_messages([
     "score": <целое число от 1 до 5>,
     "feedback": "<краткий отзыв>",
     "understanding_level": "<поверхностное|базовое|среднее|хорошее|глубокое>",
-    "missed_concepts": ["<пропущенные важные концепции>"],
-    "follow_ups_answered": <целое число: сколько follow-up вопросов покрыто корректно>
+    "missed_concepts": ["<пропущенные важные концепции>"]
 }}'''),
     ('human', '''Вопрос: {question}
 Тип вопроса: {question_type}
@@ -387,14 +387,9 @@ RELEVANCE_PROMPT = ChatPromptTemplate.from_messages([
     ('system', '''Вы — эксперт по оценке релевантности ответов.
 Ваша задача — проверить, насколько ответ соответствует заданному вопросу.
 
-Оцените по целочисленной шкале от 1 до 5:
-- 1: ответ не по вопросу
-- 2: частично по теме, много лишнего
-- 3: по теме, но покрытие неполное
-- 4: хорошо соответствует основному и части follow-up
-- 5: полно и точно покрывает основной вопрос и ВСЕ follow-up вопросы
-
-ЖЕСТКОЕ ПРАВИЛО: 5 возможно только если покрыты все follow-up вопросы.
+Используйте целочисленную оценку от 1 до 5.
+Оценивайте только релевантность и полноту соответствия вопросу/подвопросам.
+Не применяйте глобальную рубрику целиком — этот агент отвечает только за relevance.
 
 Проверяйте релевантность к основному вопросу и follow-up вопросам.
 Фокус этого агента: соответствие ответа поставленным вопросам.
@@ -405,8 +400,7 @@ RELEVANCE_PROMPT = ChatPromptTemplate.from_messages([
     "feedback": "<краткий отзыв>",
     "answered_parts": ["<на что ответил>"],
     "missing_parts": ["<что не затронул>"],
-    "off_topic": ["<что было лишним>"],
-    "follow_ups_answered": <целое число: сколько follow-up вопросов покрыто>
+    "off_topic": ["<что было лишним>"]
 }}'''),
     ('human', '''Вопрос: {question}
 
@@ -431,14 +425,9 @@ LEVEL_ALIGNMENT_PROMPT = ChatPromptTemplate.from_messages([
 - Middle: уверенное владение, понимание trade-offs
 - Senior: глубокая экспертиза, архитектурное мышление
 
-Оцените по целочисленной шкале от 1 до 5:
-- 1: уровень ответа сильно ниже ожидаемого
-- 2: заметно ниже ожидаемого уровня
-- 3: частично соответствует уровню
-- 4: хорошо соответствует уровню
-- 5: полностью соответствует или превосходит ожидаемый уровень и корректно покрывает основной и все follow-up вопросы
-
-ЖЕСТКОЕ ПРАВИЛО: 5 ставьте только при полном покрытии follow-up вопросов.
+Используйте целочисленную оценку от 1 до 5.
+Оценивайте только соответствие ожидаемому уровню кандидата.
+Не применяйте глобальную рубрику целиком — этот агент отвечает только за level alignment.
 
 Оцените, насколько ответ соответствует ожиданиям от уровня {level}
 с учетом основного вопроса и follow-up вопросов.
@@ -449,8 +438,7 @@ LEVEL_ALIGNMENT_PROMPT = ChatPromptTemplate.from_messages([
     "score": <целое число от 1 до 5>,
     "feedback": "<краткий отзыв>",
     "actual_level": "<Junior|Middle|Senior>",
-    "gap_analysis": "<анализ разрыва между ожидаемым и фактическим уровнем>",
-    "follow_ups_answered": <целое число: сколько follow-up вопросов покрыто корректно>
+    "gap_analysis": "<анализ разрыва между ожидаемым и фактическим уровнем>"
 }}'''),
     ('human', '''Ожидаемый уровень кандидата: {level}
 Вопрос: {question}
@@ -630,26 +618,38 @@ class CodeQualityAgent:
     """Агент оценки качества кода."""
     
     WEIGHT = AGENT_WEIGHTS['Code Quality Agent']
+    NON_CODE_WEIGHT = 0.0
     
     def __init__(self, llm=None):
         self.llm = llm or get_llm()
         self.chain = CODE_QUALITY_PROMPT | self.llm
+
+    @classmethod
+    def _weight_for_question_type(cls, question_type: str) -> float:
+        qtype = (question_type or '').strip().lower()
+        # Для не-кодовых вопросов снижаем влияние Code Quality в общей оценке.
+        if 'код' in qtype:
+            return cls.WEIGHT
+        return cls.NON_CODE_WEIGHT
     
     async def evaluate(
         self,
         question: str,
         answer: str,
+        question_type: str,
         tech_stack: str,
         reference_answers: str = 'Эталонные ответы не найдены.',
         follow_ups: list[str] | None = None,
     ) -> AgentScore:
         """Оценить качество кода/изложения."""
+        effective_weight = self._weight_for_question_type(question_type)
         _agent_log('agent_start', f'CodeQualityAgent start question={question[:160]} answer={answer[:200]}')
         _agent_log('rag_result', f'CodeQualityAgent references={reference_answers}')
         try:
             response = await self.chain.ainvoke({
                 'question': question,
                 'answer': answer,
+                'question_type': question_type,
                 'tech_stack': tech_stack,
                 'reference_answers': reference_answers,
                 'follow_ups': _format_followups_for_prompt(follow_ups),
@@ -658,8 +658,6 @@ class CodeQualityAgent:
             data = parse_json_response(response.content)
             if data:
                 score = _normalize_agent_score(data.get('score', 3))
-                followups_answered = _parse_followups_answered(data.get('follow_ups_answered', 0))
-                score = _apply_followup_gate(score, follow_ups, followups_answered)
                 return AgentScore(
                     agent_name='Code Quality Agent',
                     score=score,
@@ -667,10 +665,10 @@ class CodeQualityAgent:
                     details={
                         'strengths': data.get('strengths', []),
                         'improvements': data.get('improvements', []),
-                        'follow_ups_answered': followups_answered,
+                        'weight_used': effective_weight,
                     },
                     error=False,
-                    weight=self.WEIGHT,
+                    weight=effective_weight,
                 )
         except Exception as e:
             print(f'Ошибка CodeQualityAgent: {e}')
@@ -682,7 +680,7 @@ class CodeQualityAgent:
             feedback='⚠️ Агент завершился с ошибкой',
             details=None,
             error=True,
-            weight=self.WEIGHT,
+            weight=effective_weight,
         )
 
 
@@ -720,8 +718,6 @@ class ConceptualUnderstandingAgent:
             data = parse_json_response(response.content)
             if data:
                 score = _normalize_agent_score(data.get('score', 3))
-                followups_answered = _parse_followups_answered(data.get('follow_ups_answered', 0))
-                score = _apply_followup_gate(score, follow_ups, followups_answered)
                 return AgentScore(
                     agent_name='Conceptual Understanding Agent',
                     score=score,
@@ -729,7 +725,6 @@ class ConceptualUnderstandingAgent:
                     details={
                         'understanding_level': data.get('understanding_level', ''),
                         'missed_concepts': data.get('missed_concepts', []),
-                        'follow_ups_answered': followups_answered,
                     },
                     error=False,
                     weight=self.WEIGHT,
@@ -778,8 +773,6 @@ class RelevanceAgent:
             data = parse_json_response(response.content)
             if data:
                 score = _normalize_agent_score(data.get('score', 3))
-                followups_answered = _parse_followups_answered(data.get('follow_ups_answered', 0))
-                score = _apply_followup_gate(score, follow_ups, followups_answered)
                 return AgentScore(
                     agent_name='Relevance Agent',
                     score=score,
@@ -788,7 +781,6 @@ class RelevanceAgent:
                         'answered_parts': data.get('answered_parts', []),
                         'missing_parts': data.get('missing_parts', []),
                         'off_topic': data.get('off_topic', []),
-                        'follow_ups_answered': followups_answered,
                     },
                     error=False,
                     weight=self.WEIGHT,
@@ -841,8 +833,6 @@ class LevelAlignmentAgent:
             data = parse_json_response(response.content)
             if data:
                 score = _normalize_agent_score(data.get('score', 3))
-                followups_answered = _parse_followups_answered(data.get('follow_ups_answered', 0))
-                score = _apply_followup_gate(score, follow_ups, followups_answered)
                 return AgentScore(
                     agent_name='Level Alignment Agent',
                     score=score,
@@ -850,7 +840,6 @@ class LevelAlignmentAgent:
                     details={
                         'actual_level': data.get('actual_level', ''),
                         'gap_analysis': data.get('gap_analysis', ''),
-                        'follow_ups_answered': followups_answered,
                     },
                     error=False,
                     weight=self.WEIGHT,
@@ -1109,7 +1098,7 @@ class AssessmentCoordinator:
         
         results = await asyncio.gather(
             self.correctness_agent.evaluate(question, answer, question_type, tech_stack, reference_answers, follow_ups),
-            self.code_quality_agent.evaluate(question, answer, tech_stack, reference_answers, follow_ups),
+            self.code_quality_agent.evaluate(question, answer, question_type, tech_stack, reference_answers, follow_ups),
             self.conceptual_agent.evaluate(question, answer, question_type, tech_stack, reference_answers, follow_ups),
             self.relevance_agent.evaluate(question, answer, reference_answers, follow_ups),
             self.level_alignment_agent.evaluate(question, answer, candidate_level, tech_stack, reference_answers, follow_ups),
@@ -1137,7 +1126,7 @@ class AssessmentCoordinator:
         
         print('  → Code Quality Agent...')
         code_quality = await self.code_quality_agent.evaluate(
-            question, answer, tech_stack, reference_answers, follow_ups
+            question, answer, question_type, tech_stack, reference_answers, follow_ups
         )
         await asyncio.sleep(self.request_delay)
         

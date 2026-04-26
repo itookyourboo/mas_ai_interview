@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
+from time import perf_counter
+from types import MethodType
 from typing import Any
 
 import sys
@@ -62,6 +64,26 @@ def _clamp_1_5(value: float) -> int:
     if rounded > 5:
         return 5
     return rounded
+
+
+def _normalize_followups_local(follow_ups: list[str] | None) -> list[str]:
+    if not follow_ups:
+        return []
+    normalized: list[str] = []
+    for item in follow_ups:
+        text = str(item).strip()
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _format_duration(seconds: float) -> str:
+    total = max(0, int(seconds))
+    h, rem = divmod(total, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 def _build_dataset() -> list[CalibrationQuestion]:
@@ -306,6 +328,26 @@ def _agent_scores_brief(agent_scores: list[dict[str, Any]]) -> list[dict[str, An
     return brief
 
 
+def _format_agent_scores_line(agent_scores: list[dict[str, Any]]) -> str:
+    if not agent_scores:
+        return "agents: none"
+    parts: list[str] = []
+    for item in agent_scores:
+        name = str(item.get("agent_name", "unknown"))
+        if item.get("error"):
+            parts.append(f"{name}=ERR")
+            continue
+        score = item.get("score")
+        if score is None:
+            parts.append(f"{name}=n/a")
+            continue
+        try:
+            parts.append(f"{name}={float(score):.2f}")
+        except (TypeError, ValueError):
+            parts.append(f"{name}={score}")
+    return "agents: " + ", ".join(parts)
+
+
 def _parse_scores_filter(raw: str | None) -> list[int]:
     if not raw:
         return [1, 2, 3, 4, 5]
@@ -331,10 +373,18 @@ async def run_calibration(
     max_concurrency: int = 1,
     save_case_logs: bool = True,
     scores_filter: list[int] | None = None,
+    max_cases: int | None = None,
+    quiet: bool = False,
+    skip_followup_validation: bool = False,
+    disable_assessment_debug: bool = False,
+    use_question_cache: bool = True,
+    fail_fast_on_error: bool = True,
 ) -> dict[str, Any]:
+    if disable_assessment_debug:
+        _settings.ASSESSMENT_DEBUG_LOGS = False
+
     dataset = _build_dataset()
     selected_scores = sorted(set(scores_filter or [1, 2, 3, 4, 5]))
-    total_cases = len(dataset) * len(selected_scores)
     rows: list[dict[str, Any]] = []
     case_entries: list[tuple[int, int, CalibrationQuestion, int, str]] = []
     case_no = 0
@@ -350,14 +400,126 @@ async def run_calibration(
                     case.answers_by_score[expected_score],
                 )
             )
+    if max_cases is not None and max_cases > 0:
+        case_entries = case_entries[:max_cases]
+    total_cases = len(case_entries)
+    if total_cases == 0:
+        raise RuntimeError("No calibration cases selected. Check --scores/--max-cases.")
 
     out_dir = PROJECT_ROOT / "data" / "calibration"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     case_log_path = out_dir / f"agent_calibration_cases_{ts}.jsonl"
 
-    semaphore = asyncio.Semaphore(max(1, int(max_concurrency)))
+    worker_count = max(1, int(max_concurrency))
+    semaphore = asyncio.Semaphore(worker_count)
     case_logs: list[dict[str, Any]] = []
+    coordinators = [
+        AssessmentCoordinator(mode=coordinator_mode, request_delay=0.0)
+        for _ in range(worker_count)
+    ]
+    coordinator_locks = [asyncio.Lock() for _ in range(worker_count)]
+    print(
+        "Runtime models: "
+        f"chat={_settings.OLLAMA_CHAT_MODEL} "
+        f"embed={_settings.OLLAMA_EMBED_MODEL} "
+        f"provider={_settings.LLM_PROVIDER}",
+        flush=True,
+    )
+    first_retriever = coordinators[0].retriever if coordinators else None
+    if first_retriever is not None:
+        collection_name = getattr(getattr(first_retriever, "vectorstore", None), "_collection", None)
+        resolved_collection = (
+            getattr(collection_name, "name", None) if collection_name is not None else _settings.RAG_COLLECTION_NAME
+        )
+        print(
+            "Runtime RAG: "
+            f"db_path={_settings.RAG_DB_PATH} "
+            f"collection={resolved_collection}",
+            flush=True,
+        )
+
+    def _install_speedups(coordinator: AssessmentCoordinator) -> None:
+        if use_question_cache and coordinator.retriever:
+            ref_cache: dict[tuple[str, tuple[str, ...], int], tuple[str, list[dict[str, Any]]]] = {}
+            original_retrieve = coordinator.retriever.build_context_for_assessment
+
+            def cached_retrieve(
+                *,
+                question_text: str,
+                tags: list[str] | None = None,
+                top_k: int = 5,
+            ) -> tuple[str, list[dict[str, Any]]]:
+                tags_key = tuple(
+                    sorted(
+                        {
+                            str(t).strip().lower()
+                            for t in (tags or [])
+                            if str(t).strip()
+                        }
+                    )
+                )
+                key = (str(question_text or "").strip(), tags_key, int(top_k))
+                cached = ref_cache.get(key)
+                if cached is not None:
+                    return cached
+                value = original_retrieve(question_text=question_text, tags=tags or [], top_k=top_k)
+                ref_cache[key] = value
+                return value
+
+            coordinator.retriever.build_context_for_assessment = cached_retrieve  # type: ignore[method-assign]
+
+        if skip_followup_validation:
+            async def passthrough_followups(
+                self: AssessmentCoordinator,
+                main_question: str,
+                follow_ups: list[str] | None,
+                candidate_level: str,
+                tech_stack: str,
+            ) -> list[str]:
+                _ = (main_question, candidate_level, tech_stack)
+                return _normalize_followups_local(follow_ups)
+
+            coordinator._validate_followups = MethodType(passthrough_followups, coordinator)
+            return
+
+        if use_question_cache:
+            followup_cache: dict[tuple[str, tuple[str, ...], str, str], tuple[str, ...]] = {}
+            original_validate = coordinator._validate_followups
+
+            async def cached_validate(
+                self: AssessmentCoordinator,
+                main_question: str,
+                follow_ups: list[str] | None,
+                candidate_level: str,
+                tech_stack: str,
+            ) -> list[str]:
+                key = (
+                    str(main_question or "").strip(),
+                    tuple(_normalize_followups_local(follow_ups)),
+                    str(candidate_level or "").strip().lower(),
+                    str(tech_stack or "").strip().lower(),
+                )
+                cached = followup_cache.get(key)
+                if cached is not None:
+                    return list(cached)
+                approved = await original_validate(
+                    main_question=main_question,
+                    follow_ups=follow_ups,
+                    candidate_level=candidate_level,
+                    tech_stack=tech_stack,
+                )
+                followup_cache[key] = tuple(approved)
+                return approved
+
+            coordinator._validate_followups = MethodType(cached_validate, coordinator)
+
+    for coordinator in coordinators:
+        _install_speedups(coordinator)
+
+    start_ts = perf_counter()
+    progress_lock = asyncio.Lock()
+    progress = {"done": 0}
 
     async def run_single_case(
         case_id: int,
@@ -366,35 +528,39 @@ async def run_calibration(
         expected_score: int,
         answer: str,
     ) -> dict[str, Any]:
+        started = perf_counter()
         async with semaphore:
-            print(
-                f"[{case_id}/{total_cases}] Q{q_idx} expected={expected_score} | "
-                f"type={case.question_type} level={case.candidate_level}",
-                flush=True,
-            )
-            print(f"  question: {case.question}", flush=True)
-            print(
-                f"  follow_ups({len(case.follow_ups)}): "
-                + ("; ".join(case.follow_ups) if case.follow_ups else "none"),
-                flush=True,
-            )
-            print(f"  answer_preview: {_answer_preview(answer)}", flush=True)
+            if not quiet:
+                print(
+                    f"[{case_id}/{total_cases}] Q{q_idx} expected={expected_score} | "
+                    f"type={case.question_type} level={case.candidate_level}",
+                    flush=True,
+                )
+                print(f"  question: {case.question}", flush=True)
+                print(
+                    f"  follow_ups({len(case.follow_ups)}): "
+                    + ("; ".join(case.follow_ups) if case.follow_ups else "none"),
+                    flush=True,
+                )
+                print(f"  answer_preview: {_answer_preview(answer)}", flush=True)
 
-            coordinator = AssessmentCoordinator(mode=coordinator_mode, request_delay=0.0)
+            coordinator_idx = (case_id - 1) % worker_count
+            coordinator = coordinators[coordinator_idx]
             error_text = ""
             try:
-                assessed = await asyncio.wait_for(
-                    coordinator.assess_answer(
-                        question=case.question,
-                        answer=answer,
-                        question_type=case.question_type,
-                        tech_stack=case.tech_stack,
-                        candidate_level=case.candidate_level,
-                        question_tags=case.tags,
-                        follow_ups=case.follow_ups,
-                    ),
-                    timeout=case_timeout_sec,
-                )
+                async with coordinator_locks[coordinator_idx]:
+                    assessed = await asyncio.wait_for(
+                        coordinator.assess_answer(
+                            question=case.question,
+                            answer=answer,
+                            question_type=case.question_type,
+                            tech_stack=case.tech_stack,
+                            candidate_level=case.candidate_level,
+                            question_tags=case.tags,
+                            follow_ups=case.follow_ups,
+                        ),
+                        timeout=case_timeout_sec,
+                    )
                 assessed_dict = assessment_result_to_dict(assessed)
                 predicted = float(assessed_dict["total_score"])
             except asyncio.TimeoutError:
@@ -443,21 +609,71 @@ async def run_calibration(
                 "retrieval_score": assessed_dict.get("retrieval_score"),
                 "retrieval_references": assessed_dict.get("retrieval_references", 0),
                 "run_error": error_text,
+                "latency_sec": round(perf_counter() - started, 3),
             }
-            print(
-                f"  -> predicted={row['predicted_score']:.2f} "
-                f"rounded={row['predicted_rounded']} "
-                f"recommendation={row['recommendation']}"
-                + (f" error={error_text}" if error_text else ""),
-                flush=True,
-            )
+            if error_text:
+                print(
+                    (
+                        f"[error] case={case_id}/{total_cases} q={q_idx} "
+                        f"expected={expected_score} type={case.question_type} "
+                        f"error={error_text}"
+                    ),
+                    flush=True,
+                )
+            if not quiet:
+                print(
+                    f"  -> predicted={row['predicted_score']:.2f} "
+                    f"rounded={row['predicted_rounded']} "
+                    f"recommendation={row['recommendation']}"
+                    + (f" error={error_text}" if error_text else ""),
+                    flush=True,
+                )
+                print(
+                    f"  -> {_format_agent_scores_line(row.get('agent_scores', []))}",
+                    flush=True,
+                )
+
+            async with progress_lock:
+                progress["done"] += 1
+                done = progress["done"]
+                elapsed_sec = perf_counter() - start_ts
+                avg_sec = elapsed_sec / done if done > 0 else 0.0
+                left = max(0, total_cases - done)
+                eta_sec = avg_sec * left
+                print(
+                    (
+                        f"[progress] {done}/{total_cases} "
+                        f"({(done / total_cases) * 100:.1f}%) "
+                        f"elapsed={_format_duration(elapsed_sec)} "
+                        f"eta={_format_duration(eta_sec)} "
+                        f"avg={avg_sec:.1f}s/case"
+                    ),
+                    flush=True,
+                )
             return row
 
     tasks = [
         asyncio.create_task(run_single_case(*entry))
         for entry in case_entries
     ]
-    rows = await asyncio.gather(*tasks)
+    rows = []
+    for done_task in asyncio.as_completed(tasks):
+        row = await done_task
+        rows.append(row)
+        if fail_fast_on_error and row.get("run_error"):
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            break
+
+    if fail_fast_on_error and any(r.get("run_error") for r in rows):
+        for task in tasks:
+            if not task.done():
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
     rows.sort(key=lambda r: int(r["case_id"]))
     case_logs.extend(rows)
 
@@ -500,10 +716,26 @@ async def run_calibration(
         flush=True,
     )
 
+    if not rows:
+        raise RuntimeError("Calibration produced no rows. Check fail-fast / runtime errors.")
+
     mae = mean(abs(r["expected_score"] - r["predicted_score"]) for r in rows)
     exact_rate = sum(
         1 for r in rows if int(r["expected_score"]) == int(r["predicted_rounded"])
     ) / len(rows)
+    within_1_rate = (
+        sum(
+            1
+            for r in rows
+            if abs(int(r["expected_score"]) - int(r["predicted_rounded"])) <= 1
+        )
+        / len(rows)
+    )
+    latencies = sorted(float(r.get("latency_sec", 0.0) or 0.0) for r in rows)
+    p50_idx = len(latencies) // 2
+    p95_idx = int(0.95 * (len(latencies) - 1)) if len(latencies) > 1 else 0
+    p50_latency = latencies[p50_idx] if latencies else 0.0
+    p95_latency = latencies[p95_idx] if latencies else 0.0
 
     per_expected: dict[int, dict[str, float | None]] = {}
     for score in selected_scores:
@@ -542,13 +774,24 @@ async def run_calibration(
             "answers_per_question": len(selected_scores),
             "selected_scores": selected_scores,
             "total_cases": len(rows),
-            "max_concurrency": max(1, int(max_concurrency)),
+        "max_cases": max_cases,
+            "max_concurrency": worker_count,
             "coordinator_mode": coordinator_mode,
             "case_timeout_sec": case_timeout_sec,
+            "quiet": quiet,
+            "skip_followup_validation": skip_followup_validation,
+            "disable_assessment_debug": disable_assessment_debug,
+            "use_question_cache": use_question_cache,
         },
         "overall_metrics": {
             "mae_total_score": round(mae, 4),
             "exact_match_rate_rounded": round(exact_rate, 4),
+            "within_1_rate_rounded": round(within_1_rate, 4),
+        },
+        "speed_metrics": {
+            "avg_latency_sec": round(mean(latencies), 4) if latencies else None,
+            "p50_latency_sec": round(p50_latency, 4),
+            "p95_latency_sec": round(p95_latency, 4),
         },
         "per_expected_score_metrics": per_expected,
         "confusion_matrix_rounded": confusion,
@@ -563,10 +806,19 @@ async def run_calibration(
 
 def _print_short_report(report: dict[str, Any]) -> None:
     overall = report["overall_metrics"]
+    speed = report.get("speed_metrics", {})
     print("\n=== Calibration summary ===")
     print(f"Total cases: {report['dataset_summary']['total_cases']}")
     print(f"MAE (total_score): {overall['mae_total_score']:.3f}")
     print(f"Exact match (rounded): {overall['exact_match_rate_rounded']:.1%}")
+    print(f"Within-1 (rounded): {overall.get('within_1_rate_rounded', 0.0):.1%}")
+    if speed:
+        print(
+            "Latency (sec): "
+            f"avg={speed.get('avg_latency_sec')} "
+            f"p50={speed.get('p50_latency_sec')} "
+            f"p95={speed.get('p95_latency_sec')}"
+        )
     print("Per expected score:")
     for score in report["dataset_summary"].get("selected_scores", [1, 2, 3, 4, 5]):
         row = report["per_expected_score_metrics"][score]
@@ -610,12 +862,48 @@ async def main() -> None:
         default="1,2,3,4,5",
         help="Comma-separated expected scores subset, e.g. '5' or '3,4,5'",
     )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=None,
+        help="Optional hard limit for number of calibration cases after score filtering",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Reduce per-case console output",
+    )
+    parser.add_argument(
+        "--skip-followup-validation",
+        action="store_true",
+        help="Skip LLM follow-up validation in calibration (faster, less strict)",
+    )
+    parser.add_argument(
+        "--disable-assessment-debug",
+        action="store_true",
+        help="Disable verbose assessment debug logs for faster calibration",
+    )
+    parser.add_argument(
+        "--no-question-cache",
+        action="store_true",
+        help="Disable per-question caching of retrieval/follow-up validation",
+    )
+    parser.add_argument(
+        "--no-fail-fast-on-error",
+        action="store_true",
+        help="Disable fail-fast behavior (by default fail-fast is enabled)",
+    )
     args = parser.parse_args()
     selected_scores = _parse_scores_filter(args.scores)
     print(
         "Calibration config: "
         f"mode={args.mode}, max_concurrency={args.max_concurrency}, "
-        f"case_timeout_sec={args.case_timeout_sec}, scores={selected_scores}",
+        f"case_timeout_sec={args.case_timeout_sec}, scores={selected_scores}, "
+        f"max_cases={args.max_cases}, "
+        f"quiet={args.quiet}, skip_followup_validation={args.skip_followup_validation}, "
+        f"disable_assessment_debug={args.disable_assessment_debug}, "
+        f"use_question_cache={not args.no_question_cache}, "
+        f"fail_fast_on_error={not args.no_fail_fast_on_error}",
         flush=True,
     )
     print(
@@ -629,6 +917,12 @@ async def main() -> None:
         max_concurrency=args.max_concurrency,
         save_case_logs=not args.no_case_logs,
         scores_filter=selected_scores,
+        max_cases=args.max_cases,
+        quiet=args.quiet,
+        skip_followup_validation=args.skip_followup_validation,
+        disable_assessment_debug=args.disable_assessment_debug,
+        use_question_cache=not args.no_question_cache,
+        fail_fast_on_error=not args.no_fail_fast_on_error,
     )
     out_dir = PROJECT_ROOT / "data" / "calibration"
     out_dir.mkdir(parents=True, exist_ok=True)

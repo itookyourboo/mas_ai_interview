@@ -15,8 +15,8 @@ LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')
 
 # Ollama
 OLLAMA_BASE_URL = os.getenv('OLLAMA_BASE_URL', 'http://localhost:11434')
-OLLAMA_CHAT_MODEL = os.getenv('OLLAMA_CHAT_MODEL', 'qwen2.5:14b-instruct')
-OLLAMA_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
+OLLAMA_CHAT_MODEL = os.getenv('OLLAMA_CHAT_MODEL', 'qwen3.5:9b')
+OLLAMA_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text-v2-moe')
 
 # Настройки режима работы API
 # Режим выполнения запросов: 'parallel' (параллельно) или 'sequential' (последовательно)
