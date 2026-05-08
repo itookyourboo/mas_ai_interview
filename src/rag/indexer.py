@@ -10,12 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-try:
-    from langchain_chroma import Chroma
-except ModuleNotFoundError:  # pragma: no cover - fallback
-    from langchain_community.vectorstores import Chroma
 
 try:
     import settings
@@ -115,16 +112,67 @@ def _is_low_quality_answer(text: str) -> bool:
     return False
 
 
+def _build_splitter() -> RecursiveCharacterTextSplitter:
+    """
+    Построить сплиттер, согласованный с токенизатором эмбеддинг-модели.
+
+    Размер чанка и перекрытие в settings.RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP
+    интерпретируются как количество токенов. Это критично, потому что у моделей
+    вроде nomic-embed-text-v2-moe жёсткий лимит max_seq_length=512: при разбиении
+    по символам легко получить чанк, который модель молча обрежет.
+
+    Если HF-токенизатор недоступен (нет интернета/кэша), делаем безопасный
+    fallback на символьный сплиттер с грубой аппроксимацией 1 токен ≈ 2 символа.
+    """
+    try:
+        from transformers import AutoTokenizer  # type: ignore
+        from transformers import logging as hf_logging  # type: ignore
+
+        tokenizer = AutoTokenizer.from_pretrained(settings.RAG_TOKENIZER_NAME)
+        # Сплиттер передаёт в токенизатор полный (ещё не нарезанный) документ
+        # ради подсчёта длины. Если документ длиннее model_max_length, HF печатает
+        # warning «Token indices sequence length is longer than ...». В нашем
+        # пайплайне это безопасно: модель никогда не получает полный текст —
+        # только нарезанные чанки ≤ RAG_CHUNK_SIZE токенов. Поэтому отключаем
+        # ложно-тревожный warning, временно снимая лимит у токенизатора.
+        tokenizer.model_max_length = int(1e9)
+        hf_logging.set_verbosity_error()
+        print(
+            "[RAG] Сплиттер: token-aware "
+            f"(tokenizer={settings.RAG_TOKENIZER_NAME}, "
+            f"chunk={settings.RAG_CHUNK_SIZE} tok, "
+            f"overlap={settings.RAG_CHUNK_OVERLAP} tok)",
+            flush=True,
+        )
+        return RecursiveCharacterTextSplitter.from_huggingface_tokenizer(
+            tokenizer=tokenizer,
+            chunk_size=settings.RAG_CHUNK_SIZE,
+            chunk_overlap=settings.RAG_CHUNK_OVERLAP,
+        )
+    except Exception as exc:  # pragma: no cover - сетевой/инфраструктурный фолбэк
+        # 1 токен ≈ 2 символа (грубая оценка для русского + кода).
+        fallback_chars = settings.RAG_CHUNK_SIZE * 2
+        fallback_overlap = settings.RAG_CHUNK_OVERLAP * 2
+        print(
+            "[RAG][warn] Не удалось загрузить HF-токенизатор "
+            f"'{settings.RAG_TOKENIZER_NAME}': {exc!r}. "
+            "Падаем на символьный сплиттер "
+            f"(chunk={fallback_chars} chars, overlap={fallback_overlap} chars).",
+            flush=True,
+        )
+        return RecursiveCharacterTextSplitter(
+            chunk_size=fallback_chars,
+            chunk_overlap=fallback_overlap,
+        )
+
+
 def _build_documents(dataset: list[dict[str, Any]]) -> tuple[list[Document], IndexStats]:
     docs: list[Document] = []
     technical_items = 0
     question_docs = 0
     answer_docs = 0
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.RAG_CHUNK_SIZE,
-        chunk_overlap=settings.RAG_CHUNK_OVERLAP,
-    )
+    splitter = _build_splitter()
 
     for item in dataset:
         question = item.get("question", {}) or {}

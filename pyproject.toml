@@ -12,6 +12,7 @@ dependencies = [
     "langchain-text-splitters>=0.3.0",
     "langgraph>=1.0.1",
     "chromadb>=0.5.5",
+    "transformers>=4.40.0",
     "python-dotenv>=1.2.1",
     "streamlit>=1.40.0",
     "requests>=2.32.0",
@@ -22,3 +23,11 @@ dependencies = [
 [project.scripts]
 interview-app = "src.app:main"
 build-rag-index = "src.rag.build_index:main"
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[tool.basedpyright]
+venvPath = "."
+venv = ".venv"
